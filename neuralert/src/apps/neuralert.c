@@ -50,6 +50,7 @@
 #include "util_api.h"
 #include "limits.h"
 #include <stdint.h>
+#include <stdarg.h>
 #include "W25QXX.h"
 #include "Mc363x.h"
 #include "adc.h"
@@ -894,6 +895,20 @@ static int get_battery_voltage()
 	return adcDataNorm;
 }
 
+static int append_packet_field(size_t *length, const char *format, ...)
+{
+	va_list args;
+	size_t remaining = sizeof(mqttMessage) - *length;
+	va_start(args, format);
+	int written = vsnprintf(mqttMessage + *length, remaining, format, args);
+	va_end(args);
+	if (written < 0 || (size_t)written >= remaining) {
+		return pdTRUE;
+	}
+	*length += (size_t)written;
+	return pdFALSE;
+}
+
 /**
  *******************************************************************************
  * @brief send one JSON packet from the intermediate samples buffer
@@ -913,13 +928,14 @@ static int get_battery_voltage()
 
 int send_json_packet(int count, const unsigned int transmission, const int sequence)
 {
-	if (count > MAX_SAMPLES_PER_PACKET) {
-		count = MAX_SAMPLES_PER_PACKET;
+	if (count < 0 || count > MAX_SAMPLES_PER_PACKET) {
+		PRINTF("\n Neuralert: [%s] invalid sample count: %d", __func__, count);
+		return pdTRUE;
 	}
 
 	int return_status = 0;
 	int i;
-	unsigned char str[80], str2[40];		// temp working strings for assembling
+	size_t message_length = 0;
 	int16_t Xvalue;
 	int16_t Yvalue;
 	int16_t Zvalue;
@@ -934,7 +950,7 @@ int send_json_packet(int count, const unsigned int transmission, const int seque
 	time_t now;
 #endif /* __TIME64__ */
 	struct tm;
-	char nowStr[20];
+
 
 	// get data from user memory
 	if (take_semaphore(&User_semaphore)) {
@@ -952,13 +968,12 @@ int send_json_packet(int count, const unsigned int transmission, const int seque
 	/*
 	 * JSON preamble
 	 */
-	snprintf(mqttMessage, sizeof(mqttMessage), "%s", "{\r\n\t\"state\":\r\n\t{\r\n\t\t\"reported\":\r\n\t\t{\r\n");
+	if (append_packet_field(&message_length, "%s", "{\r\n\t\"state\":\r\n\t{\r\n\t\t\"reported\":\r\n\t\t{\r\n")) goto packet_too_large;
 	/*
 	 * MAC address of device - stored in retention memory
 	 * during the bootup event
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\"id\": \"%s\",\r\n", device_id);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\"id\": \"%s\",\r\n", device_id)) goto packet_too_large;
 
 
 	/* New timesync field added 1/26/23 per ECO approved by Neuralert
@@ -980,43 +995,36 @@ int send_json_packet(int count, const unsigned int transmission, const int seque
 	 *
 	 */
 
-	snprintf((char *)str, sizeof(str),"\t\t\t\"timesync\": \"%s\",\r\n", timesync);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\"timesync\": \"%s\",\r\n", timesync)) goto packet_too_large;
 
 	/* get battery value */
 	int adcData = get_battery_voltage();
-	snprintf((char *)str, sizeof(str),"\t\t\t\"bat\": %d,\r\n",adcData);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\"bat\": %d,\r\n",adcData)) goto packet_too_large;
 
 	// META FIELD DEFINITIONS HERE
 	// Meta data field -- a json for whatever we want.
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", "\t\t\t\"meta\":\r\n\t\t\t{\r\n");
+	if (append_packet_field(&message_length, "%s", "\t\t\t\"meta\":\r\n\t\t\t{\r\n")) goto packet_too_large;
 	/*
 	 * Meta - MAC address of device - stored in retention memory
 	 * during the bootup event
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"id\": \"%s\",\r\n",device_id);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"id\": \"%s\",\r\n",device_id)) goto packet_too_large;
 	/*
 	* Meta - Firmware Version
 	*/
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"ver\": \"%s\",\r\n", USER_VERSION_STRING);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"ver\": \"%s\",\r\n", USER_VERSION_STRING)) goto packet_too_large;
 	/*
 	 * Meta - Transmission sequence #
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"trans\": %d,\r\n", transmission);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"trans\": %u,\r\n", transmission)) goto packet_too_large;
 	/*
 	 * Meta - Message sequence this transmission
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"seq\": %d,\r\n", sequence);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"seq\": %d,\r\n", sequence)) goto packet_too_large;
 	/*
 	* Meta - Battery value this transmission
 	*/
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"bat\": %d,\r\n",adcData);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"bat\": %d,\r\n",adcData)) goto packet_too_large;
 
 
 	/*
@@ -1024,79 +1032,65 @@ int send_json_packet(int count, const unsigned int transmission, const int seque
 	*/
 	__time64_t current_time;
 	user_time64_msec_since_poweron(&current_time);
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"mins\": %ld,\r\n", (uint32_t)(current_time/60000));
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"mins\": %ld,\r\n", (long)(current_time/60000))) goto packet_too_large;
 
 	/*
 	* Meta - rssi value at this transmission
 	*/
 	int rssi = get_current_rssi(WLAN0_IFACE);
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"rssi\": %d,\r\n", rssi);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"rssi\": %d,\r\n", rssi)) goto packet_too_large;
 
 	/*
 	* Meta - threshold used for next transmission
 	*/
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"thres\": %d,\r\n", tx_thres);
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"thres\": %d,\r\n", tx_thres)) goto packet_too_large;
 
 	/*
 	 * Meta - Remaining free heap size (to monitor for significant leaks)
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\t\"mem\": %d\r\n", xPortGetFreeHeapSize());
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\t\"mem\": %d\r\n", xPortGetFreeHeapSize())) goto packet_too_large;
 
 	// End meta data field (close bracket)
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", "\t\t\t},\r\n");
+	if (append_packet_field(&message_length, "%s", "\t\t\t},\r\n")) goto packet_too_large;
 
 
 	/*
 	 *  Accelerometer X values
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\"accX\": [");
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\"accX\": [")) goto packet_too_large;
 	for(i=0;i<count;i++)
 	{
 		Xvalue = accelXmitData[i].Xvalue;
-		snprintf((char *)str, sizeof(str),"%d ",Xvalue);
-		snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+		if (append_packet_field(&message_length, "%d ",Xvalue)) goto packet_too_large;
 	}
-	snprintf((char *)str, sizeof(str),"],\r\n");
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "],\r\n")) goto packet_too_large;
 
 	/*
 	 *  Accelerometer Y values
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\"accY\": [");
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\"accY\": [")) goto packet_too_large;
 	for(i=0;i<count;i++)
 	{
 		Yvalue = accelXmitData[i].Yvalue;
-		snprintf((char *)str, sizeof(str),"%d ",Yvalue);
-		snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+		if (append_packet_field(&message_length, "%d ",Yvalue)) goto packet_too_large;
 	}
-	snprintf((char *)str, sizeof(str),"],\r\n");
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "],\r\n")) goto packet_too_large;
 
 	/*
 	 *  Accelerometer Z values
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\"accZ\": [");
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\"accZ\": [")) goto packet_too_large;
 	for(i=0;i<count;i++)
 	{
 		Zvalue = accelXmitData[i].Zvalue;
-		snprintf((char *)str, sizeof(str),"%d ",Zvalue);
-		snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+		if (append_packet_field(&message_length, "%d ",Zvalue)) goto packet_too_large;
 	}
-	snprintf((char *)str, sizeof(str),"],\r\n");
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "],\r\n")) goto packet_too_large;
 
 	/*
 	 *  Timestamps
 	 */
-	snprintf((char *)str, sizeof(str),"\t\t\t\"ts\": [");
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "\t\t\t\"ts\": [")) goto packet_too_large;
 	// Note - as of 9/2/22 timestamps are in milliseconds,
 	// measured from the time the device was booted.
 	// So the largest expected timestamp will be at 5 days:
@@ -1112,30 +1106,18 @@ int send_json_packet(int count, const unsigned int transmission, const int seque
 		uint64_t num1 = ((now/1000000) * 1000000);
 		uint64_t num2 = now - num1;
 		uint32_t num3 = num2;
-		snprintf(nowStr, sizeof(nowStr),"%03ld",(long)(now/1000000));
-		snprintf((char *)str2, sizeof(str2),"%06ld ",num3);
-		snprintf(nowStr + strlen(nowStr), sizeof(nowStr) - strlen(nowStr), "%s", str2);
-		snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", nowStr);
+		if (append_packet_field(&message_length, "%03ld%06lu ",
+				(long)(now/1000000), (unsigned long)num3)) goto packet_too_large;
 	}
-	snprintf((char *)str, sizeof(str),"]\r\n");
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", str);
+	if (append_packet_field(&message_length, "]\r\n")) goto packet_too_large;
 
 	/*
 	 * Closing braces
 	 */
-	snprintf(mqttMessage + strlen(mqttMessage), sizeof(mqttMessage) - strlen(mqttMessage), "%s", "\r\n\t\t}\r\n\t}\r\n}\r\n");
+	if (append_packet_field(&message_length, "%s", "\r\n\t\t}\r\n\t}\r\n}\r\n")) goto packet_too_large;
 
 	unsigned int packet_len = strlen(mqttMessage);
 	PRINTF("\n Neuralert: [%s]: %d total message length", __func__, packet_len);
-	// Sanity check in case some future person expands message
-	// without increasing buffer size
-	if (packet_len > MAX_JSON_STRING_SIZE)
-	{
-		PRINTF("\nNeuralert: [%s] JSON packet size too big: %d with limit %d", __func__, packet_len, (int)MAX_JSON_STRING_SIZE);
-		user_reboot();
-	}
-
-
 	return_status = user_mqtt_send_message();
 
 	if(return_status == 0)
@@ -1148,6 +1130,10 @@ int send_json_packet(int count, const unsigned int transmission, const int seque
 	}
 	vTaskDelay(3); // to display the print statements
 	return return_status;
+
+packet_too_large:
+	PRINTF("\n Neuralert: [%s] packet formatting failed; message not sent", __func__);
+	return pdTRUE;
 }
 
 /**
@@ -4017,9 +4003,10 @@ static void user_reboot(void)
  * @return  int
  ****************************************************************************************
  */
-static int neuralert_provisioning_step1(const char *_recData, char *reply_buf, uint32_t *reply_len)
+static int neuralert_provisioning_step1(const char *_recData, char *reply_buf, size_t reply_capacity, uint32_t *reply_len)
 {
 	int return_val = pdTRUE;
+	*reply_len = 0;
 	cJSON *cur_json = NULL;
 
 
@@ -4052,8 +4039,13 @@ static int neuralert_provisioning_step1(const char *_recData, char *reply_buf, u
 			if (strcmp(cur_json->valuestring, USER_PROVISIONING_KEY) == 0) {
 				PRINTF("Provided key matches, reply with device info\r\n");
 
-				*reply_len = snprintf(reply_buf, *reply_len + 1, "{\"software\":\"%s\",\"version\":\"%s\",\"build\":\"%s %s\",\"id\":\"%s\"}",
+				int written = snprintf(reply_buf, reply_capacity, "{\"software\":\"%s\",\"version\":\"%s\",\"build\":\"%s %s\",\"id\":\"%s\"}",
 	USER_SOFTWARE_PART_NUMBER_STRING, USER_VERSION_STRING, __DATE__, __TIME__, MACaddr);
+				if (written < 0 || (size_t)written >= reply_capacity) {
+					PRINTF("[%s] device reply exceeds buffer capacity\r\n", __func__);
+					goto end_of_task;
+				}
+				*reply_len = (uint32_t)written;
 
 			} else {
 				PRINTF("[%s] key is incorrect\r\n", __func__);
@@ -4316,7 +4308,8 @@ void tcp_server_thread(void *arg)
 
 	unsigned char* msg_buf = NULL;
 	unsigned char* reply_buf = NULL;
-	uint32_t reply_len = 100; // hardcoded here
+	const size_t reply_capacity = 101;
+	uint32_t reply_len = 0;
     while (1) {
         client_sock = -1;
         memset(&client_addr, 0x00, sizeof(struct sockaddr_in));
@@ -4420,11 +4413,13 @@ void tcp_server_thread(void *arg)
     				vPortFree(reply_buf);
     				reply_buf = NULL;
     			}
-    			reply_buf = pvPortMalloc(reply_len + 1);
-    			memset(reply_buf, 0x00, sizeof(reply_buf));
-
-    			fail_flag = neuralert_provisioning_step1((char *)msg_buf, (char *)reply_buf, &reply_len);
-    			reply_buf[reply_len] = '\0';
+			reply_buf = pvPortMalloc(reply_capacity);
+			if (reply_buf == NULL) {
+				PRINTF("[%s] unable to allocate device reply\r\n", __func__);
+			} else {
+				fail_flag = neuralert_provisioning_step1((char *)msg_buf,
+						(char *)reply_buf, reply_capacity, &reply_len);
+			}
 
     			if (!fail_flag) {
     				// Send the provisioning packet back to the host (only if successful)
@@ -4469,6 +4464,8 @@ void tcp_server_thread(void *arg)
 
     	if (fail_flag){
     		PRINTF("Error parsing json -- trying again\r\n");
+		close(client_sock);
+		client_sock = -1;
     		continue;
     	}
 
